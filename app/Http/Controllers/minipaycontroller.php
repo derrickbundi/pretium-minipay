@@ -8,7 +8,6 @@ use App\Models\{
     MinipayPaybill,
     MinipayUser,
     MinipayFavorite,
-    Xpay,
     MinipayErrorLog,
     Country
 };
@@ -134,66 +133,21 @@ class minipaycontroller extends Controller
         $user = MinipayUser::where('public_key', $request->address)->first();
 
         $me = DB::transaction(function() use($user,$request) {
-            $type = $request->has('account_number') ? self::PAYBILL : self::BUY_GOODS;
-            $command_id = $request->has('account_number') ? 'BusinessPayBill' : 'BusinessBuyGoods';
-            $new_code = $request->has('account_number') ? $request->account_number : strtoupper(Str::random(6));
-
-            // if($request->has('account_number')) {
-            //     $type = self::PAYBILL;
-            //     $command_id = 'BusinessPayBill';
-            //     $new_code = $request->account_number;
-            // } else {
-            //     $type = self::BUY_GOODS;
-            //     $command_id = 'BusinessBuyGoods';
-            //     $new_code = strtoupper(Str::random(6));
-            // }
-
-            if($request->has('mobile')) {
-                $type = self::MOBILE;
-                $prompt = $this->paymentservice->mpesa_prompt_business_pay_bill($request->mobile,$request->amount,$new_code);
-            } else {
-                $prompt = $this->paymentservice->pay_to_pay_bill_or_buy_goods($request->amount,$command_id,$request->shortcode,$new_code,'0799770833');
-            }
-
-            if(isset($prompt->ResponseCode)) {
-                $convo_id = $request->has('mobile') ? $new_code : $prompt->ConversationID;
-                $message = 'Success! Processing payment...';
-                $response_code = $prompt->ResponseCode;
-                $is_disbursed = MinipayPaybill::PENDING;
-
-                if($request->favorite == true) {
-                    MinipayFavoriteJob::dispatch($user,$type,$request->shortcode,$new_code)->delay(Carbon::now()->addSeconds(30))->onQueue('emails');
-                }
-            } else {
-                $convo_id = $request->has('mobile') ? null : $prompt['requestId'];
-                $message = $request->has('mobile') ? "Unknown error encountered" : $prompt['errorMessage'];
-                $response_code = $prompt['errorCode'];
-                $is_disbursed = MinipayPaybill::FAILED;
-            }
-
-            MinipayPaybill::create([
-                "minipay_user_id" => $user->id,
-                "transaction_hash" => $request->hash,
-                "shortcode" => $request->has('mobile') ? $request->mobile : $request->shortcode,
-                "amount" => $request->amount,
-                "amount_in_usd" => $request->amount_in_usd,
-                "facilitation_fee" => $request->fee,
-                "account_number" => $new_code,
-                "status" => $request->status,
-                "type" =>  $type,
-                "is_disbursed" => $is_disbursed,
-                "message" => $message,
-                "conversation_id" => $convo_id
+            $prompt = Http::post(config('services.prod_master_uri') . '/merchant', [
+                'mobile' => $request->mobile,
+                'amount' => $request->amount,
+                'type' => $request->has('account_number') ? self::PAYBILL : self::BUY_GOODS,
+                'shortcode' => $request->shortcode,
+                'transaction_code' => $request->has('account_number') ? $request->account_number : strtoupper(Str::random(6)),
+                'command_id' => $request->has('account_number') ? 'BusinessPayBill' : 'BusinessBuyGoods',
+                'user' => $user
             ]);
 
-            $data = [
-                'status' => $is_disbursed,
-                'message' => $message
-            ];
+            $response = $prompt->json();
 
             $response_data = [
-                'status' => $is_disbursed,
-                'message' => $message
+                'status' => $response->status,
+                'message' => $response->message
             ];
             
             return $response_data;
@@ -231,14 +185,6 @@ class minipaycontroller extends Controller
         }
 
         $me = DB::transaction(function() use($transaction) {
-            $distributor = Xpay::where('category','m')->first();
-            $prk = $this->encryptionservice->decryptPrk(
-                $distributor->private_key,
-                $distributor->public_key,
-                config('services.dev_email'),
-                config('services.ethanol')
-            );
-
             switch($transaction->currency_code) {
                 case 'NGN':
                     $country_id = 4;
@@ -251,37 +197,26 @@ class minipaycontroller extends Controller
                     break;
             }
 
-            $fee_in_usd = $this->userservice->amount_in_usd($country_id,$transaction->facilitation_fee);
-            $amount = $transaction->amount_in_usd - $fee_in_usd;
+            $prompt = Http::post(config('services.prod_master_uri') . '/refund', [
+                'facilitation_fee' => $transaction->facilitation_fee,
+                'amount' => $request->amount,
+                'country_id' => $country_id,
+                'public_key' => $transaction->minipay_user->public_key,
+                'asset' => "cUSD"
+            ]);
 
-            $issue = $this->blockchainaccountservice->make_payment($amount,$transaction->minipay_user->public_key,$prk,'cUSD');
-            if(isset($issue['error_code']) || $issue->status() != 201) {
-                if(isset($issue['error_code'])) {
-                    $message = $issue['message'];
-                } else {
-                    $response_data = $issue->json();
-                    $message = $response_data['message'];
-                }
-                $status = false;
-            } else {
-                $message = "Refunded successfully!";
-                $status = true;
-            }
-            
-            $transaction->is_disbursed = MinipayPaybill::REFUNDED;
-            $transaction->save();
+            $response = $prompt->json();
 
-            $data = [
-                'status' => $status,
-                'message' => $message
+            $response_data = [
+                'status' => $response->status,
+                'message' => $response->message
             ];
             
-            return $data;
+            return $response_data;
         });
         return response()->json($me,200);
     }
     public function log_error(Request $request) {
-        logger($request->all());
         MinipayErrorLog::create([
             "shortcode" => $request->has('mobile') ? $request->mobile : $request->shortcode,
             "amount" => $request->amount,
@@ -336,50 +271,18 @@ class minipaycontroller extends Controller
 
             $country = Country::find($country_id);
 
-            $airtime = $this->airtimeservice->buy_airtime($country,$request->amount,$request->mobile);
-
-            $request_id = null;
-            if($airtime['data']->errorMessage != "None") {
-                $message = $airtime['data']->errorMessage;
-                $is_disbursed = MinipayPaybill::FAILED;
-            } else {
-                $is_sent = null;
-                $message = null;
-                $airtime_result = $airtime['data']->responses;
-
-                foreach($airtime_result as $result) {
-                    $is_sent = $result->status;
-                    $request_id = $result->requestId;
-                    $message = "Success! Processing airtime...";
-                }
-
-                if($is_sent == 'Failed') {
-                    $is_disbursed = MinipayPaybill::FAILED;
-                } else {
-                    $is_disbursed = MinipayPaybill::PENDING;
-                }
-            }
-
-            MinipayPaybill::create([
-                "minipay_user_id" => $user->id,
-                "transaction_hash" => $request->hash,
-                "shortcode" => $request->mobile,
-                "amount" => $request->amount,
-                "amount_in_usd" => $request->amount_in_usd,
-                "facilitation_fee" => $request->fee,
-                "account_number" => strtoupper(Str::random(6)),
-                "status" => $request->status,
-                "type" =>  self::AIRTIME,
-                "is_disbursed" => $is_disbursed,
-                "message" => $message,
-                "conversation_id" => $request_id,
-                "currency_code" => $request->currency_code,
-                "mpesa_payload" => json_encode($airtime['data'])
+            $prompt = Http::post(config('services.prod_master_uri') . '/airtime', [
+                'mobile' => $request->mobile,
+                'amount' => $request->amount,
+                'country' => $country,
+                'user' => $user
             ]);
 
+            $response = $prompt->json();
+
             $response_data = [
-                'status' => $is_disbursed,
-                'message' => $message
+                'status' => $response->status,
+                'message' => $response->message
             ];
             
             return $response_data;
