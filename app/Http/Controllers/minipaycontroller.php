@@ -233,6 +233,7 @@ class minipaycontroller extends Controller
         switch($currency_code) {
             case 'ng':
                 $id = 4;
+                $deduction = config('services.buying_rate_deduction') + 1;
                 break;
             case 'sa':
                 $id = 6;
