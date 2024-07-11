@@ -4,7 +4,7 @@ import { celo } from 'viem/chains'
 import { stableTokenABI } from '@celo/abis'
 
 const STABLE_TOKEN_ADDRESS = "0x765DE816845861e75A25fCA122bb6898B8B1282a"
-const PRETIUM_WALLET = "0x3Eaab84B42F9fCf2A9B3f2FDB83572B4153eE958"
+const PRETIUM_WALLET = "xxxxx"
 let address = null
 let exchange_rate, currency_code
 
